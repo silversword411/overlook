@@ -321,6 +321,13 @@ fn end_session(account: &Account, id: &AccountId, gmail: Option<Arc<overlook_pro
     Ok(())
 }
 
+/// Stands in for the active account while the device has none. Only the "Add an account"
+/// screen renders then (see [`MailWindow::has_account`]), so no mail is read or written
+/// under this id.
+fn no_account() -> Account {
+    Account { id: AccountId::from(""), provider: ProviderKind::Sample, display_name: String::new(), email: String::new(), created_at: 0 }
+}
+
 /// "Sign in again" for Google accounts, "Update password" for password accounts.
 pub(crate) fn sign_in_label_for(provider: ProviderKind) -> &'static str {
     match provider {
@@ -538,13 +545,13 @@ impl MailWindow {
         store: Arc<Store>,
         sample: SampleProvider,
         accounts: Vec<Account>,
-        active: AccountId,
+        active: Option<AccountId>,
         appearance: AppearancePreference,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         tracing::debug!("startup: window opening after {} ms", crate::since_start_ms());
-        let account = accounts.iter().find(|a| a.id == active).cloned().unwrap_or_else(|| accounts[0].clone());
+        let account = accounts.iter().find(|a| Some(&a.id) == active.as_ref()).or_else(|| accounts.first()).cloned().unwrap_or_else(no_account);
         let mut providers: HashMap<AccountId, providers::AccountProviders> = HashMap::new();
         let mut provider_issues = HashMap::new();
         for a in &accounts {
@@ -769,6 +776,13 @@ impl MailWindow {
             Ok("gmail") => this.start_google_sign_in(None, window, cx),
             Ok("imap") => this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx),
             Ok("pop3") => this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx),
+            // Asked only here, at launch: removing the last account later leaves the window empty.
+            _ if !this.has_account() => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let _ = this.update_in(cx, |this, window, cx| this.offer_sample_mailbox(window, cx));
+                })
+                .detach();
+            }
             _ => {}
         }
 
@@ -822,6 +836,38 @@ impl MailWindow {
         })
         .detach();
         this
+    }
+
+    /// False when the device has no accounts and the window shows "Add an account".
+    pub(crate) fn has_account(&self) -> bool {
+        !self.accounts.is_empty()
+    }
+
+    fn offer_sample_mailbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Info,
+            "Load the sample mailbox?",
+            Some("There are no accounts on this device yet."),
+            &["Load sample mailbox", "Not now"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update_in(cx, |this, window, cx| this.load_sample_account(window, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn load_sample_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::seed_sample_account(&self.store) {
+            Ok(sample) => {
+                self.providers.insert(sample.id.clone(), providers::AccountProviders::new(Arc::new(self.sample.clone()), Some(Arc::new(self.sample.clone()))));
+                self.accounts = self.store.accounts().unwrap_or_default();
+                self.switch_account(sample.id, window, cx);
+            }
+            Err(e) => crate::ui::toast(window, cx, crate::notify::Level::Error, format!("Couldn’t load the sample mailbox: {e}")),
+        }
     }
 
     pub(crate) fn owner(&self) -> Address {
@@ -1021,15 +1067,26 @@ impl MailWindow {
         self.syncing.remove(&id);
         self.refresh_idle_watchers();
         self.accounts = self.store.accounts().unwrap_or_default();
-        if self.accounts.is_empty() {
-            if let Ok(sample) = crate::seed_sample_account(&self.store) {
-                self.providers.insert(sample.id.clone(), providers::AccountProviders::new(Arc::new(self.sample.clone()), Some(Arc::new(self.sample.clone()))));
-                self.accounts.push(sample);
-            }
-        }
-        let next = self.accounts[0].id.clone();
         crate::ui::toast(window, cx, crate::notify::Level::Info, format!("Removed {} from this device.", account.email));
-        self.switch_account(next, window, cx);
+        match self.accounts.first().map(|a| a.id.clone()) {
+            Some(next) => self.switch_account(next, window, cx),
+            None => self.show_no_account(cx),
+        }
+    }
+
+    /// Leaves the window on the "Add an account" screen once the last account is gone.
+    fn show_no_account(&mut self, cx: &mut Context<Self>) {
+        self.account = no_account();
+        self.view = MailboxView::Kind(LabelKind::Inbox);
+        self.filter = ListFilter::All;
+        self.selected = None;
+        self.outbox_selected = None;
+        self.thread.clear();
+        self.expanded.clear();
+        self.mail_index = MailIndex::default();
+        self.mail_index_account = None;
+        self.reload(cx);
+        cx.notify();
     }
 
     // ---------------------------------------------------------------- updates
@@ -2312,6 +2369,10 @@ impl MailWindow {
 
     /// Opens the composer from a `mailto:` link.
     pub(crate) fn compose_mailto(&mut self, m: overlook_core::mailto::Mailto, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_account() {
+            crate::ui::toast(window, cx, crate::notify::Level::Info, "Add an account to send mail.");
+            return;
+        }
         let mut draft = Draft::new(self.account.id.clone(), DraftKind::New, now());
         draft.to = m.to;
         draft.cc = m.cc;
@@ -2940,22 +3001,7 @@ impl MailWindow {
                     .gap(px(20.))
                     .pl(px(10.))
                     .pr(px(8.))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .w(px(214.))
-                            .flex_none()
-                            .child(brand_tile(30.))
-                            .child(
-                                div()
-                                    .font_family("Source Serif 4 Display")
-                                    .text_size(px(22.))
-                                    .line_height(px(30.))
-                                    .text_color(p.foreground)
-                                    .child("Overlook"),
-                            ),
-                    )
+                    .child(brand_lockup(&p))
                     .child(
                         h_flex()
                             .items_center()
@@ -3320,6 +3366,24 @@ fn shellexpand_home(path: &str) -> String {
 
 /// The app icon drawn from vectors: midnight rounded tile, ivory horizon mark, amber beacon.
 /// Crisp at any scale, unlike a downscaled bitmap.
+/// The mark and wordmark at the left of the title bar.
+fn brand_lockup(p: &Palette) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .gap(px(10.))
+        .w(px(214.))
+        .flex_none()
+        .child(brand_tile(30.))
+        .child(
+            div()
+                .font_family("Source Serif 4 Display")
+                .text_size(px(22.))
+                .line_height(px(30.))
+                .text_color(p.foreground)
+                .child("Overlook"),
+        )
+}
+
 fn brand_tile(size: f32) -> impl IntoElement {
     let midnight: Hsla = Rgba::from(gpui_kit::rgb(0x101C24)).into();
     let ivory: Hsla = Rgba::from(gpui_kit::rgb(0xF0EBDD)).into();
@@ -3353,6 +3417,9 @@ impl Render for MailWindow {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             tracing::info!("startup: first frame after {} ms", crate::since_start_ms());
+        }
+        if !self.has_account() {
+            return self.render_no_account(cx).into_any_element();
         }
         let p: Palette = *cx.palette();
         v_flex()
@@ -3415,6 +3482,54 @@ impl Render for MailWindow {
             .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
             .when(self.quick_look.is_some(), |d| d.child(self.render_quick_look(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
+            .into_any_element()
+    }
+}
+
+impl MailWindow {
+    /// The whole window while the device has no accounts: only adding one is possible.
+    fn render_no_account(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p: Palette = *cx.palette();
+        v_flex()
+            .id("mail-window")
+            .key_context(WINDOW_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_escape))
+            .size_full()
+            .bg(p.background)
+            .text_color(p.foreground)
+            .font_family("Inter")
+            .text_size(px(13.))
+            .relative()
+            .child(
+                TitleBar::new()
+                    .h(px(64.))
+                    .bg(p.surface)
+                    .border_b_1()
+                    .border_color(p.divider)
+                    .child(h_flex().size_full().items_center().pl(px(10.)).child(brand_lockup(&p))),
+            )
+            .children(self.render_banner(cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.))
+                    .text_color(p.muted)
+                    .child(icon("mail").size(px(28.)).text_color(p.divider))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(p.foreground).child("No accounts on this device"))
+                    .child(div().text_size(px(12.)).child("Add an account to start reading and sending mail."))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .pt(px(10.))
+                            .child(Button::new("empty-add-gmail").primary().small().label("Add Gmail account").on_click(cx.listener(|this, _, window, cx| this.start_google_sign_in(None, window, cx))))
+                            .child(Button::new("empty-add-imap").small().label("Add IMAP account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Imap, SetupMode::New, window, cx))))
+                            .child(Button::new("empty-add-pop3").small().label("Add POP3 account").on_click(cx.listener(|this, _, window, cx| this.open_account_setup(ProviderKind::Pop3, SetupMode::New, window, cx)))),
+                    ),
+            )
+            .when(self.account_setup.is_some(), |d| d.child(self.render_account_setup(cx)))
     }
 }
 

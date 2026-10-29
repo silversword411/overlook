@@ -81,15 +81,11 @@ pub fn seed_sample_account(store: &Store) -> anyhow::Result<Account> {
     Ok(account)
 }
 
-/// Opens the profile database and makes sure at least one account exists so the shell
-/// always has local mail to work with offline.
+/// Opens the profile database. With no accounts yet, the window offers the sample mailbox.
 fn open_store() -> anyhow::Result<(Arc<Store>, Vec<Account>)> {
     let dir = data_dir();
     let store = Store::open(&dir.join("overlook.sqlite"))?;
-    let mut accounts = store.accounts()?;
-    if accounts.is_empty() {
-        accounts.push(seed_sample_account(&store)?);
-    }
+    let accounts = store.accounts()?;
     Ok((Arc::new(store), accounts))
 }
 
@@ -308,12 +304,12 @@ fn main() {
             window_min_size: Some(size(px(880.), px(560.))),
             ..TitleBar::window_options()
         };
-        let active: AccountId = store
+        let active: Option<AccountId> = store
             .setting::<AccountId>("active_account")
             .ok()
             .flatten()
             .filter(|id| accounts.iter().any(|a| &a.id == id))
-            .unwrap_or_else(|| accounts[0].id.clone());
+            .or_else(|| accounts.first().map(|a| a.id.clone()));
         let store = store.clone();
         let accounts = accounts.clone();
         let provider = provider.clone();
